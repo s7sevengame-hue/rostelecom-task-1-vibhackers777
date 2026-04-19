@@ -21,6 +21,13 @@ EVENTS_PATH = PROJECT_DIR / "data" / "events.csv"
 CUTOFF_DATE = pd.Timestamp("2025-06-01")
 LOOKBACK_START = CUTOFF_DATE - pd.Timedelta(days=365)
 RECOMMENDATIONS_COUNT = 6
+RISK_TREND_CUTOFFS = pd.to_datetime([
+    "2024-06-01",
+    "2024-09-01",
+    "2024-12-01",
+    "2025-03-01",
+    "2025-06-01",
+])
 DATA_COLS = [
     "order_id",
     "order_item_id",
@@ -173,6 +180,38 @@ def build_sales_marts(data: pd.DataFrame, orders: pd.DataFrame):
 
 
 @st.cache_data(show_spinner=True)
+def build_product_marts(data: pd.DataFrame):
+    brand_sales = (
+        data.groupby("brand", as_index=False)
+        .agg(
+            revenue=("sale_price", "sum"),
+            order_items=("order_item_id", "count"),
+            return_rate=("is_returned", "mean"),
+        )
+        .sort_values("revenue", ascending=False)
+        .head(15)
+    )
+    gender_category = (
+        data.groupby(["gender", "category"], as_index=False)
+        .agg(
+            revenue=("sale_price", "sum"),
+            order_items=("order_item_id", "count"),
+        )
+        .sort_values("revenue", ascending=False)
+    )
+    department_mix = (
+        data.groupby("department", as_index=False)
+        .agg(
+            revenue=("sale_price", "sum"),
+            order_items=("order_item_id", "count"),
+            avg_price=("sale_price", "mean"),
+        )
+        .sort_values("revenue", ascending=False)
+    )
+    return brand_sales, gender_category, department_mix
+
+
+@st.cache_data(show_spinner=True)
 def build_customer_marts(data: pd.DataFrame, orders: pd.DataFrame, events: pd.DataFrame):
     customer_orders = (
         orders.groupby("user_id", as_index=False)
@@ -218,7 +257,7 @@ def build_customer_marts(data: pd.DataFrame, orders: pd.DataFrame, events: pd.Da
 
 
 @st.cache_data(show_spinner=True)
-def build_risk_features(data: pd.DataFrame, events: pd.DataFrame):
+def build_risk_features_for_cutoff(data: pd.DataFrame, events: pd.DataFrame, cutoff_date: pd.Timestamp):
     orders = (
         data.groupby("order_id", as_index=False)
         .agg(
@@ -231,10 +270,12 @@ def build_risk_features(data: pd.DataFrame, events: pd.DataFrame):
         .dropna(subset=["user_id", "created_at"])
     )
 
-    history_orders = orders[orders["created_at"] < CUTOFF_DATE].copy()
-    window_orders = history_orders[(history_orders["created_at"] >= LOOKBACK_START) & (history_orders["created_at"] < CUTOFF_DATE)].copy()
-    window_items = data[(data["created_at_naive"] >= LOOKBACK_START) & (data["created_at_naive"] < CUTOFF_DATE)].copy()
-    window_events = events[(events["created_at_naive"] >= LOOKBACK_START) & (events["created_at_naive"] < CUTOFF_DATE)].copy()
+    lookback_start = cutoff_date - pd.Timedelta(days=365)
+
+    history_orders = orders[orders["created_at"] < cutoff_date].copy()
+    window_orders = history_orders[(history_orders["created_at"] >= lookback_start) & (history_orders["created_at"] < cutoff_date)].copy()
+    window_items = data[(data["created_at_naive"] >= lookback_start) & (data["created_at_naive"] < cutoff_date)].copy()
+    window_events = events[(events["created_at_naive"] >= lookback_start) & (events["created_at_naive"] < cutoff_date)].copy()
 
     base_users = (
         history_orders.groupby("user_id", as_index=False)
@@ -246,8 +287,8 @@ def build_risk_features(data: pd.DataFrame, events: pd.DataFrame):
         )
     )
     base_users = base_users[(base_users["total_orders_before_cutoff"] >= 2) | (base_users["loyal_flag"] == True)].copy()
-    base_users["days_since_last_order"] = (CUTOFF_DATE - base_users["last_order_at"]).dt.days
-    base_users["customer_age_days"] = (CUTOFF_DATE - base_users["first_order_at"]).dt.days
+    base_users["days_since_last_order"] = (cutoff_date - base_users["last_order_at"]).dt.days
+    base_users["customer_age_days"] = (cutoff_date - base_users["first_order_at"]).dt.days
 
     order_features = (
         window_orders.groupby("user_id", as_index=False)
@@ -284,7 +325,7 @@ def build_risk_features(data: pd.DataFrame, events: pd.DataFrame):
             last_event_at=("created_at_naive", "max"),
         )
     )
-    event_features["days_since_last_event"] = (CUTOFF_DATE - event_features["last_event_at"]).dt.days
+    event_features["days_since_last_event"] = (cutoff_date - event_features["last_event_at"]).dt.days
     event_features["events_per_session_last_365d"] = event_features["events_last_365d"] / event_features["sessions_last_365d"]
 
     risk_features = (
@@ -319,7 +360,13 @@ def build_risk_features(data: pd.DataFrame, events: pd.DataFrame):
         labels=["Низкий риск", "Средний риск", "Высокий риск"],
         include_lowest=True,
     )
+    risk_features["cutoff_date"] = cutoff_date
     return risk_features
+
+
+@st.cache_data(show_spinner=True)
+def build_risk_features(data: pd.DataFrame, events: pd.DataFrame):
+    return build_risk_features_for_cutoff(data, events, CUTOFF_DATE)
 
 
 @st.cache_data(show_spinner=True)
@@ -337,6 +384,53 @@ def build_category_stats(data: pd.DataFrame):
     category_stats["revenue_per_item"] = category_stats["revenue"] / category_stats["order_items"]
     category_stats["safety_score"] = (1 - category_stats["return_rate"]) * category_stats["revenue_per_item"]
     return category_stats
+
+
+@st.cache_data(show_spinner=True)
+def build_risk_trend(data: pd.DataFrame, events: pd.DataFrame):
+    trend_parts = []
+    for cutoff in RISK_TREND_CUTOFFS:
+        risk_slice = build_risk_features_for_cutoff(data, events, cutoff)
+        if risk_slice.empty:
+            continue
+        trend_parts.append(
+            {
+                "cutoff_date": cutoff,
+                "clients_in_model": len(risk_slice),
+                "high_risk_share": (risk_slice["risk_segment"] == "Высокий риск").mean(),
+                "avg_risk_score": risk_slice["risk_score"].mean(),
+            }
+        )
+
+    trend_df = pd.DataFrame(trend_parts).sort_values("cutoff_date")
+    if len(trend_df) >= 2:
+        x = np.arange(len(trend_df))
+        coef = np.polyfit(x, trend_df["high_risk_share"], 1)
+        next_x = len(trend_df)
+        forecast_value = np.polyval(coef, next_x)
+        forecast_value = float(np.clip(forecast_value, 0, 1))
+        forecast_date = trend_df["cutoff_date"].iloc[-1] + pd.DateOffset(months=3)
+        trend_df = pd.concat(
+            [
+                trend_df,
+                pd.DataFrame(
+                    [
+                        {
+                            "cutoff_date": forecast_date,
+                            "clients_in_model": np.nan,
+                            "high_risk_share": forecast_value,
+                            "avg_risk_score": np.nan,
+                            "is_forecast": True,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    if "is_forecast" not in trend_df.columns:
+        trend_df["is_forecast"] = False
+    trend_df["is_forecast"] = trend_df["is_forecast"].fillna(False).astype(bool)
+    return trend_df
 
 
 @st.cache_resource(show_spinner=True)
@@ -421,6 +515,41 @@ def choose_recommendation_mode(client_row: pd.Series) -> str:
     return "Обычные"
 
 
+def apply_global_filters(
+    data: pd.DataFrame,
+    events: pd.DataFrame,
+    date_from,
+    date_to,
+    genders: list[str],
+    loyalty_filter: str,
+):
+    filtered_data = data.copy()
+    filtered_events = events.copy()
+
+    if date_from is not None and date_to is not None:
+        start_ts = pd.Timestamp(date_from)
+        end_ts = pd.Timestamp(date_to) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        filtered_data = filtered_data[
+            filtered_data["created_at_naive"].between(start_ts, end_ts, inclusive="both")
+        ].copy()
+        filtered_events = filtered_events[
+            filtered_events["created_at_naive"].between(start_ts, end_ts, inclusive="both")
+        ].copy()
+
+    if genders:
+        filtered_data = filtered_data[filtered_data["gender"].fillna("unknown").isin(genders)].copy()
+
+    if loyalty_filter == "Только лояльные":
+        filtered_data = filtered_data[filtered_data["is_loyal"] == True].copy()
+    elif loyalty_filter == "Только не лояльные":
+        filtered_data = filtered_data[filtered_data["is_loyal"] != True].copy()
+
+    selected_users = filtered_data["user_id"].dropna().astype(int).unique()
+    filtered_events = filtered_events[filtered_events["user_id"].isin(selected_users)].copy()
+
+    return filtered_data, filtered_events
+
+
 st.sidebar.markdown("### Источник данных")
 use_uploaded = st.sidebar.toggle("Загрузить свои CSV", value=False)
 with st.sidebar.expander("Описание формата CSV"):
@@ -459,17 +588,62 @@ if use_uploaded:
 else:
     data, events = load_source_data()
 
+st.sidebar.markdown("### Раздел")
 page = st.sidebar.radio(
-    "Раздел",
-    ["Продажи и клиенты", "Риски и рекомендации", "Карточка клиента"],
+    "Навигация",
+    ["Кто наши клиенты", "Продукт", "Что влияет на уход", "Динамика ухода и прогноз", "Карточка клиента"],
+    label_visibility="collapsed",
 )
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Фильтры")
+min_date = data["created_at_naive"].min().date()
+max_date = data["created_at_naive"].max().date()
+selected_period = st.sidebar.date_input(
+    "Период",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+if isinstance(selected_period, tuple) and len(selected_period) == 2:
+    selected_date_from, selected_date_to = selected_period
+else:
+    selected_date_from, selected_date_to = min_date, max_date
+
+gender_options = sorted(data["gender"].fillna("unknown").astype(str).unique().tolist())
+selected_genders = st.sidebar.multiselect(
+    "Пол",
+    options=gender_options,
+    default=gender_options,
+)
+loyalty_option = st.sidebar.selectbox(
+    "Лояльность",
+    options=["Все клиенты", "Только лояльные", "Только не лояльные"],
+    index=0,
+)
+
+data, events = apply_global_filters(
+    data,
+    events,
+    selected_date_from,
+    selected_date_to,
+    selected_genders,
+    loyalty_option,
+)
+
+if data.empty:
+    st.title("Раздел")
+    st.warning("По выбранным фильтрам данные не найдены. Попробуйте расширить период или снять часть ограничений.")
+    st.stop()
 
 st.title(page)
 
-if page == "Продажи и клиенты":
+if page == "Кто наши клиенты":
     orders = build_orders(data)
     monthly_sales, category_sales, state_sales = build_sales_marts(data, orders)
     customer_orders, customer_360 = build_customer_marts(data, orders, events)
+
+    st.caption("Лист показывает клиентскую базу, структуру продаж и основные продуктовые предпочтения по выбранным фильтрам.")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Выручка, у.е.", f"{orders['order_value'].sum():,.0f}")
@@ -549,9 +723,81 @@ if page == "Продажи и клиенты":
         )
         st.plotly_chart(fig_revenue, use_container_width=True)
 
-elif page == "Риски и рекомендации":
+elif page == "Продукт":
+    orders = build_orders(data)
+    _, category_sales, _ = build_sales_marts(data, orders)
+    brand_sales, gender_category, department_mix = build_product_marts(data)
+
+    top_line_1, top_line_2, top_line_3 = st.columns(3)
+    top_line_1.metric("Категорий в продаже", f"{data['category'].nunique():,}")
+    top_line_2.metric("Брендов в продаже", f"{data['brand'].nunique():,}")
+    top_line_3.metric("Средняя доля возвратов", f"{data['is_returned'].mean():.1%}")
+
+    row1, row2 = st.columns(2)
+    with row1:
+        top_categories_ru = category_sales.head(12).rename(
+            columns={"revenue": "Выручка", "category": "Категория", "department": "Отдел"}
+        )
+        fig_cat = px.bar(
+            top_categories_ru,
+            x="Выручка",
+            y="Категория",
+            color="Отдел",
+            orientation="h",
+            title="Категории, которые формируют выручку",
+        )
+        fig_cat.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_cat, use_container_width=True)
+    with row2:
+        risky_categories = category_sales.sort_values("return_rate", ascending=False).head(12).rename(
+            columns={"return_rate": "Доля возвратов", "category": "Категория", "department": "Отдел"}
+        )
+        fig_returns = px.bar(
+            risky_categories,
+            x="Доля возвратов",
+            y="Категория",
+            color="Отдел",
+            orientation="h",
+            title="Категории с самым высоким уровнем возвратов",
+        )
+        fig_returns.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_returns, use_container_width=True)
+
+    row3, row4 = st.columns(2)
+    with row3:
+        brand_sales_ru = brand_sales.rename(columns={"brand": "Бренд", "revenue": "Выручка"})
+        fig_brand = px.bar(
+            brand_sales_ru,
+            x="Выручка",
+            y="Бренд",
+            orientation="h",
+            title="Бренды-лидеры по выручке",
+        )
+        fig_brand.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_brand, use_container_width=True)
+    with row4:
+        gender_mix = (
+            gender_category.groupby("gender", as_index=False)
+            .agg(revenue=("revenue", "sum"), order_items=("order_items", "sum"))
+            .rename(columns={"gender": "Пол", "revenue": "Выручка"})
+        )
+        fig_gender = px.pie(
+            gender_mix,
+            names="Пол",
+            values="Выручка",
+            title="Как распределяется выручка по полу",
+        )
+        st.plotly_chart(fig_gender, use_container_width=True)
+
+elif page == "Что влияет на уход":
     risk_features = build_risk_features(data, events)
     category_stats = build_category_stats(data)
+
+    if risk_features.empty:
+        st.warning("После фильтрации клиентов для анализа риска не осталось. Попробуйте расширить период или снять часть фильтров.")
+        st.stop()
+
+    st.caption("Лист показывает структуру риска ухода, типичные факторы и категории, где выше вероятность негативного клиентского опыта.")
 
     st.markdown("## Общая картина риска")
     col1, col2, col3 = st.columns(3)
@@ -610,9 +856,64 @@ elif page == "Риски и рекомендации":
     )
     st.dataframe(top20_risk, use_container_width=True)
 
+elif page == "Динамика ухода и прогноз":
+    risk_trend = build_risk_trend(data, events)
+
+    if risk_trend.empty:
+        st.warning("По выбранным фильтрам не удалось собрать динамику риска.")
+        st.stop()
+
+    st.caption("Лист показывает, как меняется доля клиентов высокого риска во времени и какой прогноз можно ожидать на следующий период.")
+
+    actual_trend = risk_trend[~risk_trend["is_forecast"]].copy()
+    forecast_trend = risk_trend[risk_trend["is_forecast"]].copy()
+
+    top1, top2, top3 = st.columns(3)
+    top1.metric("Исторических срезов", f"{len(actual_trend):,}")
+    top2.metric("Последняя доля высокого риска", f"{actual_trend['high_risk_share'].iloc[-1]:.1%}")
+    if not forecast_trend.empty:
+        top3.metric("Прогноз на следующий срез", f"{forecast_trend['high_risk_share'].iloc[0]:.1%}")
+    else:
+        top3.metric("Прогноз на следующий срез", "Нет")
+
+    trend_plot_df = risk_trend.copy()
+    trend_plot_df["Период"] = trend_plot_df["cutoff_date"].dt.strftime("%Y-%m-%d")
+    trend_plot_df["Тип точки"] = np.where(trend_plot_df["is_forecast"], "Прогноз", "История")
+
+    row1, row2 = st.columns(2)
+    with row1:
+        fig_trend = px.line(
+            trend_plot_df,
+            x="Период",
+            y="high_risk_share",
+            color="Тип точки",
+            markers=True,
+            title="Доля клиентов высокого риска по срезам",
+            labels={"high_risk_share": "Доля высокого риска"},
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
+    with row2:
+        fig_score = px.bar(
+            actual_trend.assign(Период=actual_trend["cutoff_date"].dt.strftime("%Y-%m-%d")),
+            x="Период",
+            y="avg_risk_score",
+            title="Средний риск-скор по историческим срезам",
+            labels={"avg_risk_score": "Средний риск-скор"},
+        )
+        st.plotly_chart(fig_score, use_container_width=True)
+
+    st.markdown("### Что важно по этому листу")
+    st.write("- Мы видим не только текущий риск, но и то, как он меняется во времени.")
+    st.write("- Прогнозный срез нужен как сигнал: если тренд растет, удерживающие действия нужно усиливать заранее.")
+
 elif page == "Карточка клиента":
     orders = build_orders(data)
     risk_features = build_risk_features(data, events)
+
+    if risk_features.empty:
+        st.warning("После фильтрации клиентов для карточки не осталось. Попробуйте расширить период или снять часть фильтров.")
+        st.stop()
+
     recommender = None
     with st.spinner("Собираем рекомендательный движок..."):
         try:
@@ -620,7 +921,6 @@ elif page == "Карточка клиента":
         except Exception:
             recommender = None
 
-    st.markdown("## Карточка клиента")
     available_users = risk_features["user_id"].sort_values().tolist()
     default_user = int(
         risk_features.sort_values("risk_score", ascending=False).iloc[0]["user_id"]
